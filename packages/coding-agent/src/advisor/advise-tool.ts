@@ -100,10 +100,14 @@ export function isAdvisorInterruptImmuneTurnActive(opts: {
  *   auto-resume anything, so it is delivered live. Parking it during an active
  *   run instead strands it (it never reaches the running agent) and the withheld
  *   notes dump as one burst at the next user prompt — the bug this guards.
- * - During the post-interrupt immune-turn window, further `concern` notes are
- *   downgraded to asides; preservation still wins. A `blocker` is exempt: it
- *   means the agent handed off broken or unexercised work, so it still steers a
- *   triggered turn even right after a prior interrupt (#5628).
+ * - During the post-interrupt immune-turn window, further interrupting notes —
+ *   `concern` AND `blocker` alike — are downgraded to asides; preservation
+ *   still wins. The single exception: a `blocker` that arrives while a turn is
+ *   already streaming still steers, because joining a running turn creates no
+ *   new turn. Downgrading idle blockers matters because each steered blocker
+ *   re-arms the window and each triggered turn ends in another terminal answer
+ *   for the next blocker to wake — without the downgrade, an advisor that
+ *   labels churn as `blocker` can re-trigger primary turns indefinitely.
  */
 export function resolveAdvisorDeliveryChannel(opts: {
 	severity: AdvisorSeverity | undefined;
@@ -119,7 +123,7 @@ export function resolveAdvisorDeliveryChannel(opts: {
 		return "preserve";
 	if (!isInterruptingSeverity(opts.severity)) return "aside";
 	if (opts.autoResumeSuppressed && (opts.aborting || !opts.streaming)) return "preserve";
-	if (opts.interruptImmuneTurnActive && opts.severity !== "blocker") return "aside";
+	if (opts.interruptImmuneTurnActive && (opts.severity !== "blocker" || !opts.streaming)) return "aside";
 	return "steer";
 }
 

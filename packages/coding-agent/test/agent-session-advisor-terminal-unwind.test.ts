@@ -208,3 +208,98 @@ it.each(["concern", "nit", "blocker"] as const)(
 		expect(primaryContexts[terminalCalls]).toContain(nextUserMarker);
 	},
 );
+
+// Regression: the first end-of-turn blocker still steers a triggered turn
+// (#5628), and that steer arms the immune-turn window — so a second blocker,
+// arriving with no human message in between, is downgraded to a non-interrupting
+// aside instead of re-triggering yet another primary turn. Before the downgrade,
+// blocker #2 recreated the loop: each triggered turn ended in another terminal
+// answer for the next blocker to wake.
+it("downgrades the second idle end-of-turn blocker to an aside after the first one steered", async () => {
+	const temp = TempDir.createSync("@pi-advisor-blocker-immune-");
+	const auth = await AuthStorage.create(":memory:");
+	auth.setRuntimeApiKey("anthropic", "test-key");
+	const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+	if (!model) throw new Error("Expected bundled model");
+
+	let primaryCalls = 0;
+	const primaryMock = createMockModel({
+		id: "blocker-immune-primary",
+		provider: "anthropic",
+		handler: async () => {
+			primaryCalls++;
+			if (primaryCalls === 1) return toolResponse("step-1", "step");
+			return textResponse(`terminal answer ${primaryCalls}`);
+		},
+	});
+	const advisorMock = createMockModel({
+		id: "blocker-immune-advisor",
+		provider: "anthropic",
+		handler: async () => textResponse("advisor quiet"),
+	});
+	const agent = new Agent({
+		getApiKey: () => "test-key",
+		initialState: {
+			model,
+			systemPrompt: ["blocker immune window regression"],
+			tools: [makeTool("step", async () => ({ content: [{ type: "text", text: "step complete" }] }))],
+		},
+		streamFn: (messages, context, options) => primaryMock.stream(messages, context, options),
+	});
+	const settings = Settings.isolated({
+		"compaction.enabled": false,
+		"retry.enabled": false,
+		"advisor.syncBacklog": "off",
+	});
+	settings.setModelRole("advisor", "anthropic/claude-sonnet-4-5");
+	const session = new AgentSession({
+		agent,
+		sessionManager: SessionManager.inMemory(),
+		settings,
+		modelRegistry: new ModelRegistry(auth, temp.join("models.yml")),
+		advisorTools: [],
+		advisorStreamFn: advisorMock.stream,
+	});
+	active = { session, auth, temp };
+	if (!session.setAdvisorEnabled(true)) throw new Error("Expected advisor runtime");
+
+	let agentStarts = 0;
+	const secondAgentStart = Promise.withResolvers<void>();
+	session.subscribe(event => {
+		if (event.type !== "agent_start") return;
+		agentStarts++;
+		if (agentStarts === 2) secondAgentStart.resolve();
+	});
+	const advisor = session.getAdvisorAgent();
+	if (!advisor) throw new Error("Expected advisor agent");
+	const advise = advisor.state.tools.find(tool => tool.name === "advise");
+	if (!advise) throw new Error("Expected advise tool");
+
+	// Turn 1 ends in a terminal answer; idle, no queued work.
+	await session.prompt("run a step then finish");
+	await session.waitForIdle();
+	expect(agentStarts).toBe(1);
+
+	// Blocker #1: idle + terminal tail + immune window not yet armed -> steers a
+	// triggered turn (#5628) and arms the immune window on delivery.
+	const first = await advise.execute("blocker-1", { note: "first end-of-turn blocker", severity: "blocker" });
+	expect(contentText(first.content)).toContain("Delivered");
+	await secondAgentStart.promise;
+	await session.waitForIdle();
+	expect(agentStarts).toBe(2);
+	const turn2Calls = primaryCalls;
+
+	// Blocker #2: still no human message, immune window active -> aside, no new turn.
+	const second = await advise.execute("blocker-2", { note: "second end-of-turn blocker", severity: "blocker" });
+	expect(contentText(second.content)).toContain("Delivered");
+	await session.waitForIdle();
+	expect(agentStarts).toBe(2);
+	expect(primaryCalls).toBe(turn2Calls);
+
+	// Exactly one steered advisor message; the aside has not spawned another.
+	const cards = session.agent.state.messages.filter(
+		(message: AgentMessage) =>
+			message.role === "custom" && "customType" in message && message.customType === "advisor",
+	);
+	expect(cards.length).toBe(1);
+});

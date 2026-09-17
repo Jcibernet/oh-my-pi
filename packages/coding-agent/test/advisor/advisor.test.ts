@@ -6460,7 +6460,7 @@ describe("advisor", () => {
 			).toBe("steer");
 		});
 
-		it("downgrades concern to aside during immune turns, but still steers a blocker (#5628)", () => {
+		it("downgrades concern and idle blocker to aside during immune turns (#5628 refinement)", () => {
 			expect(
 				resolveAdvisorDeliveryChannel({
 					severity: "concern",
@@ -6478,7 +6478,7 @@ describe("advisor", () => {
 					aborting: false,
 					interruptImmuneTurnActive: true,
 				}),
-			).toBe("steer");
+			).toBe("aside");
 			expect(
 				resolveAdvisorDeliveryChannel({
 					severity: "blocker",
@@ -6489,6 +6489,34 @@ describe("advisor", () => {
 				}),
 			).toBe("preserve");
 		});
+
+		it("still steers a blocker that joins an already-streaming turn during immune turns", () => {
+			// Joining a running turn creates no new turn, so #5628 liveness holds
+			// where it actually applies; only turn-creating idle delivery is downgraded.
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "blocker",
+					autoResumeSuppressed: false,
+					streaming: true,
+					aborting: false,
+					interruptImmuneTurnActive: true,
+				}),
+			).toBe("steer");
+		});
+
+		it("downgrades a terminal-answer blocker during immune turns so it cannot re-trigger the restatement loop", () => {
+			expect(
+				resolveAdvisorDeliveryChannel({
+					severity: "blocker",
+					autoResumeSuppressed: false,
+					streaming: false,
+					aborting: false,
+					terminalAnswerNoQueuedWork: true,
+					interruptImmuneTurnActive: true,
+				}),
+			).toBe("aside");
+		});
+
 		it("preserves an interrupting note while suppressed AND idle (no auto-resume of a stopped run)", () => {
 			for (const severity of ["concern", "blocker"] as const) {
 				expect(
